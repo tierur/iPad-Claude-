@@ -1,0 +1,10 @@
+# Xcode / Swift Playgrounds
+xcuserdata/
+*.xcuserstate
+.build/
+DerivedData/
+.swiftpm/xcode/
+*.xcworkspace/xcuserdata/
+
+# macOS
+.DS_Store
