@@ -40,7 +40,10 @@ final class SessionStore: ObservableObject {
         for file in files where file.pathExtension == "json" {
             do {
                 let data = try Data(contentsOf: file)
-                loaded.append(try Self.decoder.decode(StudySession.self, from: data))
+                var session = try Self.decoder.decode(StudySession.self, from: data)
+                if session.pages.isEmpty { session.pages = [Page(number: 1)] }
+                session.currentPageIndex = min(max(session.currentPageIndex, 0), session.pages.count - 1)
+                loaded.append(session)
             } catch {
                 loadError = "Impossible de lire \(file.lastPathComponent) : \(error.localizedDescription)"
             }

@@ -6,7 +6,7 @@ import UIKit
 struct TranscriptionOutcome {
     var transcription: Transcription
     var snapshot: PageSnapshot?
-    var onDevice: RecognitionResult?
+    var local: LocalRecognition?
 }
 
 enum TranscriptionStage {
@@ -17,8 +17,8 @@ enum TranscriptionStage {
     var label: String {
         switch self {
         case .rendering: return "Capture de la page…"
-        case .onDevice: return "Reconnaissance de l'écriture sur l'iPad…"
-        case .claude: return "Analyse de l'image par Claude…"
+        case .onDevice: return "Reconnaissance locale (texte + symboles)…"
+        case .claude: return "Lecture des symboles incertains par Claude…"
         }
     }
 }
@@ -29,12 +29,15 @@ enum TranscriptionError: LocalizedError {
     var errorDescription: String? { "La page est vide : écrivez votre réponse avec le Pencil avant de terminer." }
 }
 
-/// Pipeline : rendu de la page → reconnaissance sur l'iPad (Vision) → si besoin, analyse de l'image par Claude.
+/// Pipeline : rendu de la page → reconnaissance locale (Vision + symboles $P) → si doute,
+/// lecture par Claude des cadres incertains, dont les réponses enrichissent la bibliothèque locale.
 final class TranscriptionService {
     private let client: AnthropicClient
+    private let library: SymbolLibrary
 
-    init(client: AnthropicClient) {
+    init(client: AnthropicClient, library: SymbolLibrary) {
         self.client = client
+        self.library = library
     }
 
     // MARK: - Pipeline
@@ -43,6 +46,7 @@ final class TranscriptionService {
                     mode: TranscriptionMode,
                     model: ClaudeModel,
                     useFallbacks: Bool,
+                    learnFromClaude: Bool,
                     mathMode: Bool = true,
                     progress: @escaping @MainActor (TranscriptionStage) -> Void) async throws -> TranscriptionOutcome {
         await progress(.rendering)
@@ -51,61 +55,75 @@ final class TranscriptionService {
         }
 
         await progress(.onDevice)
-        var onDevice: RecognitionResult? = nil
-        do {
-            onDevice = try await HandwritingRecognizer.recognize(snapshot.image, mathMode: mathMode)
-        } catch {
-            onDevice = nil
-        }
-        let draft = onDevice.map { MathNormalizer.normalize($0.text) } ?? ""
-        let draftConfidence = onDevice?.meanConfidence ?? 0
+        let ocr = try? await HandwritingRecognizer.recognize(snapshot.image, mathMode: mathMode)
+        let templates = await library.all
+        let local = await Task.detached(priority: .userInitiated) {
+            LocalHandwritingEngine.recognize(drawing: drawing, snapshot: snapshot, ocr: ocr, templates: templates)
+        }.value
+        let draft = MathNormalizer.normalize(local.text)
 
         let escalate: Bool
         switch mode {
         case .onDeviceOnly: escalate = false
         case .alwaysClaude: escalate = true
-        case .auto: escalate = Self.shouldEscalate(text: draft, confidence: draftConfidence, mathMode: mathMode)
+        case .auto: escalate = Self.shouldEscalate(local: local, draft: draft)
         }
 
         if !escalate {
-            let transcription = Transcription(text: draft, source: .onDevice, confidence: draftConfidence, onDeviceDraft: draft)
-            return TranscriptionOutcome(transcription: transcription, snapshot: snapshot, onDevice: onDevice)
+            let transcription = Transcription(text: draft,
+                                              source: .onDevice,
+                                              confidence: Self.localConfidence(local),
+                                              onDeviceDraft: draft,
+                                              localSymbolCount: local.matches.count,
+                                              uncertainSymbolCount: local.uncertain.count,
+                                              learnedSymbolCount: 0)
+            return TranscriptionOutcome(transcription: transcription, snapshot: snapshot, local: local)
         }
 
         await progress(.claude)
-        let claude = try await transcribeWithClaude(snapshot: snapshot, draft: draft, model: model, useFallbacks: useFallbacks)
-        var transcription = claude
+        var transcription = try await transcribeWithClaude(snapshot: snapshot, draft: draft, local: local,
+                                                           model: model, useFallbacks: useFallbacks, learn: learnFromClaude)
         transcription.onDeviceDraft = draft.isEmpty ? nil : draft
-        return TranscriptionOutcome(transcription: transcription, snapshot: snapshot, onDevice: onDevice)
+        return TranscriptionOutcome(transcription: transcription, snapshot: snapshot, local: local)
     }
 
-    /// Décide si le résultat de l'iPad est assez fiable pour se passer de l'analyse d'image.
-    static func shouldEscalate(text: String, confidence: Double, mathMode: Bool) -> Bool {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if trimmed.isEmpty { return true }
-        if confidence < 0.9 { return true }
-        let words = trimmed.split { $0.isWhitespace || $0.isNewline }
-        if words.count < 3 { return true }
-        if mathMode && Self.looksMathematical(trimmed) { return true }
+    /// La lecture locale suffit-elle ? Sinon on demande à Claude (mode automatique).
+    static func shouldEscalate(local: LocalRecognition, draft: String) -> Bool {
+        if draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        if !local.uncertain.isEmpty { return true }
+        if local.ocrConfidence < 0.5 { return true }
         return false
     }
 
-    static func looksMathematical(_ text: String) -> Bool {
-        let mathCharacters = CharacterSet(charactersIn: "0123456789=+-*/^_<>()[]{}|∀∃∈⊂⊆∪∩∅ℝℕℤℚℂ⇒⇔¬∧∨≤≥≠→∞∑∫√εδαβγλμπ")
-        let count = text.unicodeScalars.filter { mathCharacters.contains($0) }.count
-        return count >= 2
+    static func localConfidence(_ local: LocalRecognition) -> Double {
+        let symbolScore = local.matches.isEmpty ? 1 : local.matches.map(\.score).reduce(0, +) / Double(local.matches.count)
+        let base = 0.6 * local.ocrConfidence + 0.4 * symbolScore
+        return min(max(base - 0.1 * Double(local.uncertain.count), 0.1), 1)
     }
 
-    // MARK: - Analyse de l'image par Claude
+    // MARK: - Lecture par Claude (image + cadres numérotés)
 
     static let transcriptionSchema: JSONValue = [
         "type": "object",
         "properties": [
             "text": ["type": "string", "description": "Transcription fidèle, en Unicode, avec les retours à la ligne."],
             "confidence": ["type": "number", "description": "Confiance globale entre 0 et 1."],
-            "notes": ["type": "string", "description": "Passages douteux ou illisibles (vide si aucun)."]
+            "notes": ["type": "string", "description": "Passages douteux ou illisibles (vide si aucun)."],
+            "symbols": [
+                "type": "array",
+                "description": "Contenu exact de chaque cadre rouge numéroté (vide si aucun cadre).",
+                "items": [
+                    "type": "object",
+                    "properties": [
+                        "id": ["type": "integer"],
+                        "symbol": ["type": "string"]
+                    ],
+                    "required": ["id", "symbol"],
+                    "additionalProperties": false
+                ]
+            ]
         ],
-        "required": ["text", "confidence", "notes"],
+        "required": ["text", "confidence", "notes", "symbols"],
         "additionalProperties": false
     ]
 
@@ -116,22 +134,77 @@ final class TranscriptionService {
     - ensembles : ∈ ∉ ⊂ ⊆ ⊄ ∪ ∩ ∅ ℝ ℕ ℤ ℚ ℂ, {x ∈ E | P(x)}, intervalles ]a, b[ et [a, b]
     - comparaisons et flèches : ≤ ≥ ≠ ≈ ≡ → ↦ ⟶
     - lettres grecques : ε δ α β γ λ μ ν η θ π σ τ φ ω Ω
-    - indices et exposants : x₁ x₂ xₙ, x² xⁿ, sinon x_1 et x^n ; fractions a/b ; racines √ ; sommes ∑ ; produits ∏ ; intégrales ∫ ; limites lim ; normes ‖x‖ ; valeurs absolues |x| ; barres B(a, r), boules B̄, adhérence Ā, intérieur Å, complémentaire Aᶜ.
+    - indices et exposants : x₁ x₂ xₙ, x² xⁿ, sinon x_1 et x^n ; fractions a/b ; racines √ ; sommes ∑ ; produits ∏ ; intégrales ∫ ; limites lim ; normes ‖x‖ ; valeurs absolues |x| ; boules B(a, r), adhérence Ā, intérieur Å, complémentaire Aᶜ.
     Règles :
-    - Respecte les retours à la ligne et l'ordre des lignes. Sépare les colonnes ou blocs distincts par une ligne vide.
+    - Respecte les retours à la ligne et l'ordre des lignes. Sépare les blocs distincts par une ligne vide.
     - Ne corrige jamais les mathématiques de l'étudiant, ne complète pas, n'interprète pas : tu transcris.
     - Un mot ou symbole illisible s'écrit [?]. Une rature s'ignore.
     - Le texte courant est en français : respecte les accents.
-    - Un brouillon issu de la reconnaissance de l'iPad peut t'être fourni : il est peu fiable (les symboles mathématiques y sont souvent remplacés par des lettres) et ne sert que d'aide.
+    - Une lecture locale faite par l'iPad peut t'être fournie : elle est peu fiable (symboles mathématiques souvent remplacés par des lettres) et ne sert que d'aide.
+    - Des cadres rouges numérotés peuvent être dessinés sur l'image : ils ne font pas partie de l'écriture. Ils servent à demander ce que contient exactement chaque cadre, pour que l'iPad apprenne l'écriture de l'étudiant.
     """
 
-    func transcribeWithClaude(snapshot: PageSnapshot, draft: String, model: ClaudeModel, useFallbacks: Bool) async throws -> Transcription {
+    private struct SymbolReading: Decodable {
+        var id: Int
+        var symbol: String
+    }
+
+    private struct Reply: Decodable {
+        var text: String
+        var confidence: Double
+        var notes: String
+        var symbols: [SymbolReading]
+    }
+
+    /// Demande à Claude la transcription de la page et le contenu des cadres incertains ; apprend les symboles.
+    func transcribeWithClaude(snapshot: PageSnapshot,
+                              draft: String,
+                              local: LocalRecognition?,
+                              model: ClaudeModel,
+                              useFallbacks: Bool,
+                              learn: Bool) async throws -> Transcription {
+        var boxes: [(id: Int, rect: CGRect)] = []
+        var boxClusters: [Int: StrokeCluster] = [:]
+        var boxGuesses: [Int: String] = [:]
+        if let local {
+            var nextID = 1
+            for item in local.uncertain where nextID <= 24 {
+                boxes.append((id: nextID, rect: item.cluster.bounds))
+                boxClusters[nextID] = item.cluster
+                if let guess = item.guess { boxGuesses[nextID] = guess }
+                nextID += 1
+            }
+            for match in local.matches where nextID <= 24 {
+                guard let cluster = local.clusters.first(where: { $0.id == match.clusterID }) else { continue }
+                boxes.append((id: nextID, rect: cluster.bounds))
+                boxClusters[nextID] = cluster
+                boxGuesses[nextID] = match.label
+                nextID += 1
+            }
+        }
+        let imageToSend = boxes.isEmpty ? snapshot : DrawingRenderer.annotate(snapshot, boxes: boxes)
+
         var prompt = "Transcris cette page manuscrite."
         if !draft.isEmpty {
-            prompt += "\n\nBrouillon de la reconnaissance de l'iPad (peu fiable) :\n«««\n\(draft)\n»»»"
+            prompt += "\n\nLecture locale de l'iPad (peu fiable, aide seulement) :\n«««\n\(draft)\n»»»"
         }
+        if !boxes.isEmpty {
+            prompt += """
+
+
+            Les cadres rouges numérotés (1 à \(boxes.count)) entourent des symboles que l'iPad n'a pas su lire ou dont il n'est pas sûr. \
+            Pour chaque numéro, indique dans « symbols » le symbole ou le très court jeton exactement écrit dans le cadre \
+            (par exemple ∀, ∃, ∈, ⊂, ⇒, ⇔, ≤, ≠, ∅, ∞, ε, δ, lim, une lettre ou un chiffre). \
+            Si un cadre contient une rature ou seulement un morceau de mot, mets une chaîne vide.
+            """
+            let guesses = boxGuesses.sorted { $0.key < $1.key }.map { "\($0.key) : « \($0.value) »" }
+            if !guesses.isEmpty {
+                prompt += "\nLectures locales à confirmer ou corriger : " + guesses.joined(separator: " ; ") + "."
+            }
+        }
+
         let message = APIMessage(role: "user", content: [
-            .image(mediaType: snapshot.mediaType, base64: snapshot.base64),
+            .image(mediaType: imageToSend.mediaType, base64: imageToSend.base64),
             .text(prompt)
         ])
         var request = RequestBuilder.request(model: model,
@@ -145,16 +218,23 @@ final class TranscriptionService {
         request.cacheControl = nil
         let response = try await client.complete(request)
 
-        struct Reply: Decodable {
-            var text: String
-            var confidence: Double
-            var notes: String
-        }
         let json = TutorService.extractJSON(from: response.text)
         guard let data = json.data(using: .utf8), let reply = try? JSONDecoder().decode(Reply.self, from: data) else {
             // Réponse hors schéma : on garde le texte brut plutôt que de perdre le travail.
-            return Transcription(text: response.text, source: .claudeVision, confidence: 0.5, modelID: response.model)
+            return Transcription(text: response.text, source: .claudeVision, confidence: 0.5, modelID: response.model,
+                                 localSymbolCount: local?.matches.count, uncertainSymbolCount: local?.uncertain.count, learnedSymbolCount: 0)
         }
+
+        var learned = 0
+        if learn {
+            for reading in reply.symbols {
+                let label = reading.symbol.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let cluster = boxClusters[reading.id], SymbolLibrary.isLearnable(label), let cloud = cluster.cloud else { continue }
+                await library.learn(label: label, cloud: cloud, strokeCount: cluster.strokes.count)
+                learned += 1
+            }
+        }
+
         var text = reply.text
         if !reply.notes.trimmingCharacters(in: .whitespaces).isEmpty {
             text += "\n\n[Passages douteux : \(reply.notes)]"
@@ -162,23 +242,33 @@ final class TranscriptionService {
         return Transcription(text: text,
                              source: .claudeVision,
                              confidence: min(max(reply.confidence, 0), 1),
-                             modelID: response.model.isEmpty ? model.id : response.model)
+                             modelID: response.model.isEmpty ? model.id : response.model,
+                             localSymbolCount: local?.matches.count,
+                             uncertainSymbolCount: local?.uncertain.count,
+                             learnedSymbolCount: learned)
     }
 }
 
-/// Corrige les confusions courantes de la reconnaissance sur l'iPad dans un contexte mathématique.
+/// Corrige les confusions courantes de la reconnaissance de texte dans un contexte mathématique.
 enum MathNormalizer {
-    private static let replacements: [(String, String)] = [
-        ("<=>", "⇔"), ("=>", "⇒"), ("->", "→"), ("-->", "⟶"),
-        ("<=", "≤"), (">=", "≥"), ("!=", "≠"), ("=/=", "≠"),
-        ("+-", "±"), ("...", "…"), ("|R", "ℝ"), ("IR", "ℝ"), ("|N", "ℕ"), ("IN", "ℕ"),
-        ("€", "∈"), ("sqrt", "√"), ("inf.", "inf"), ("oo", "∞")
+    /// Remplacements littéraux (sans risque pour les mots).
+    private static let literal: [(String, String)] = [
+        ("<=>", "⇔"), ("-->", "⟶"), ("=>", "⇒"), ("->", "→"),
+        ("<=", "≤"), (">=", "≥"), ("!=", "≠"), ("=/=", "≠"), ("+-", "±"), ("...", "…"), ("|R", "ℝ"), ("|N", "ℕ")
+    ]
+    /// Remplacements sur des jetons isolés (évite « coordonnées » → « c∞rdonnées »).
+    private static let tokens: [(String, String)] = [
+        ("oo", "∞"), ("IR", "ℝ"), ("IN", "ℕ"), ("sqrt", "√"), ("€", "∈"), ("inf", "inf")
     ]
 
     static func normalize(_ text: String) -> String {
         var result = text
-        for (from, to) in replacements {
+        for (from, to) in literal {
             result = result.replacingOccurrences(of: from, with: to)
+        }
+        for (from, to) in tokens where from != to {
+            let pattern = "(?<![\\p{L}\\p{N}])" + NSRegularExpression.escapedPattern(for: from) + "(?![\\p{L}\\p{N}])"
+            result = result.replacingOccurrences(of: pattern, with: to, options: .regularExpression)
         }
         return result
     }

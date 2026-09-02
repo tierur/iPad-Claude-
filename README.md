@@ -13,13 +13,16 @@ Le projet est un **App Playground** (`ClaudePaper.swiftpm`) : il s'ouvre sans Ma
 - **Cours joints** : PDF, texte ou photos envoyés à Claude (trombone dans la discussion ou feuille « Nouvel exercice »). Exemple : joins ton cours de topologie, demande « fais-moi réviser, niveau L3 », et réponds aux questions page après page.
 - **Historique enregistré** : discussions, pages manuscrites, transcriptions et évaluations sont sauvegardées dans *Fichiers → Sur mon iPad → ClaudePaper*.
 
-### Comment l'écriture est reconnue
+### Comment l'écriture est reconnue (local d'abord, Claude en secours, apprentissage)
 
-1. **Sur l'iPad** (framework Vision, français puis anglais) : rapide et gratuit, mais il ne connaît pas les symboles mathématiques.
-2. **Analyse de l'image par Claude** : la page est rendue en image (encre noire sur blanc) et envoyée au modèle de transcription (Claude Sonnet 5 par défaut) avec un schéma de sortie strict ; il renvoie une transcription Unicode fidèle (∀, ∃, ∈, ⊂, ⇒, ε, δ, indices…) et une confiance. En mode **Automatique** (défaut), cette étape se déclenche dès que le texte contient des maths ou que la confiance de l'iPad est faible.
-3. **Repli demandé par le tuteur** : si Claude n'arrive pas à interpréter la transcription, il répond `needs_image = true` ; l'app envoie alors automatiquement l'image de la page, et la lecture faite par Claude est enregistrée comme transcription de référence.
+1. **Reconnaissance locale sur l'iPad**, sans réseau :
+   - le texte (mots, chiffres) est lu par le framework Vision (français puis anglais) ;
+   - les **symboles** (∀ ∃ ∈ ∉ ⊂ ⊆ ∪ ∩ ∅ ⇒ ⇔ → ≤ ≥ ≠ ≈ ∞ ± √ ∑ ∫ ∧ ∨ ¬ ε δ α β λ μ π θ ω φ ∂…) sont reconnus **sur les traits du Pencil** : les traits sont regroupés en symboles, puis comparés par nuages de points (algorithme $P, indépendant de l'ordre et du sens des traits) à une bibliothèque de gabarits. Là où Vision a écrit « V » ou « A » à la place d'un ∀, le symbole reconnu remplace la lettre.
+2. **Repli sur Claude** (Sonnet 5 par défaut) uniquement si un symbole reste incertain ou si la lecture est douteuse : la page est envoyée en image avec des **cadres rouges numérotés** autour des symboles incertains ; Claude renvoie la transcription complète **et** le contenu exact de chaque cadre.
+3. **Apprentissage local** : chaque cadre étiqueté par Claude devient un exemple de *ton* écriture pour ce symbole (bibliothèque enregistrée sur l'iPad, jusqu'à 20 exemples par symbole). Plus tu écris, moins l'iPad a besoin de Claude. Les exemples sont visibles et réinitialisables dans les réglages.
+4. **Repli demandé par le tuteur** : si Claude n'arrive pas à interpréter la transcription, il répond `needs_image = true` ; l'app envoie alors automatiquement l'image de la page, et la lecture faite par Claude est enregistrée comme transcription de référence.
 
-Avant l'envoi, une feuille de relecture montre l'image, le texte reconnu (modifiable) et un bouton « Analyser l'image avec Claude » (désactivable dans les réglages).
+Avant l'envoi, une feuille de relecture montre l'image, le texte reconnu (modifiable), le bilan de la reconnaissance locale (symboles reconnus, incertains, appris) et un bouton « Analyser l'image avec Claude ».
 
 ## Installation
 
@@ -61,13 +64,14 @@ Le niveau d'**effort** (faible → maximum) règle la profondeur de réflexion ;
 ## Détails techniques
 
 - **API** : Messages API en streaming SSE, réflexion adaptative (`thinking: {type: "adaptive"}`), `output_config.effort`, sorties structurées (`output_config.format` avec schéma JSON) pour le mode exercice, images en base64 (JPEG), PDF en blocs `document`, mise en cache du préfixe (`cache_control`), en-tête beta `server-side-fallback-2026-07-01` pour le repli. L'historique envoyé est en ajout seul (aucune modification des tours passés), la consigne système est figée pour toute la session.
-- **Écriture** : `PKCanvasView` (PencilKit) au-dessus d'un fond de page synchronisé avec le défilement ; rendu de l'image via `PKDrawing.image(from:scale:)`, `VNRecognizeTextRequest` (`.accurate`, `fr-FR` + `en-US`, correction linguistique coupée en mode maths).
+- **Écriture** : `PKCanvasView` (PencilKit) au-dessus d'un fond de page synchronisé avec le défilement ; rendu de l'image via `PKDrawing.image(from:scale:)`, `VNRecognizeTextRequest` (`.accurate`, `fr-FR` + `en-US`, correction linguistique coupée en mode maths, boîtes par caractère).
+- **Symboles** (`Services/SymbolRecognition/`) : `StrokeSegmenter` regroupe les traits, `PointCloud` implémente $P (32 points, appariement glouton, pénalité de proportions), `SeedSymbols` fournit les gabarits de départ, `SymbolLibrary` conserve les exemples appris (`Documents/ClaudePaper/Symbols/learned.json`), `LocalHandwritingEngine` fusionne texte et symboles par géométrie (un symbole ne remplace une lettre que si elle fait partie de ses confusions connues, et pour les symboles ambigus comme ⊂/C seulement en jeton isolé).
 - **Stockage** : JSON par session (`Documents/ClaudePaper/Sessions`), pièces jointes et instantanés de pages dans `Documents/ClaudePaper/Attachments`, clé API dans le trousseau.
 - **Structure** : `Models/` (données, catalogue de modèles, réglages), `Services/` (client API, transcription, tuteur, persistance), `ViewModels/SessionViewModel.swift` (orchestration), `Views/` (SwiftUI).
 
 ## Limites connues
 
 - Les formules sont affichées en Unicode (pas de rendu LaTeX) ; le tuteur est instruit d'écrire ainsi.
-- La reconnaissance sur l'iPad seule ne produit pas de quantificateurs : garde le mode « Automatique » ou « Toujours analyser l'image » pour les maths.
+- Les gabarits de départ sont synthétiques : les premières pages passent souvent par Claude, puis la bibliothèque se remplit avec ta propre écriture. Les seuils de confiance sont dans `LocalHandwritingEngine` si tu veux les ajuster.
 - Chaque tour renvoie tout l'historique (cours joints compris) ; le cache de préfixe réduit fortement le coût, mais un gros PDF pèse quand même sur la première requête.
 - Le projet a été écrit sans compilateur sous la main : si Xcode ou Swift Playgrounds signale une erreur, elle devrait être locale et facile à corriger — ouvre une issue avec le message.

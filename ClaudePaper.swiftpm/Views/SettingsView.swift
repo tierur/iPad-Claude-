@@ -2,9 +2,11 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject private var settings: AppSettings
+    @EnvironmentObject private var library: SymbolLibrary
     @Environment(\.dismiss) private var dismiss
     @State private var draftKey = ""
     @State private var keySaved = false
+    @State private var confirmResetSymbols = false
 
     var body: some View {
         NavigationStack {
@@ -13,6 +15,7 @@ struct SettingsView: View {
                 modelsSection
                 thinkingSection
                 handwritingSection
+                symbolsSection
                 safetySection
                 aboutSection
             }
@@ -68,7 +71,7 @@ struct SettingsView: View {
         Section {
             ModelPicker(title: "Tuteur (questions, évaluation, indices)", selection: $settings.tutorModelID)
             ModelPicker(title: "Discussion", selection: $settings.chatModelID)
-            ModelPicker(title: "Lecture de l'écriture (analyse d'image)", selection: $settings.transcriptionModelID)
+            ModelPicker(title: "Lecture de secours de l'écriture (Sonnet 5 conseillé)", selection: $settings.transcriptionModelID)
         } header: {
             Text("Modèles")
         } footer: {
@@ -115,7 +118,35 @@ struct SettingsView: View {
         } header: {
             Text("Écriture manuscrite")
         } footer: {
-            Text("La reconnaissance de l'iPad (Vision) lit le français mais pas les symboles mathématiques. En mode automatique, Claude analyse l'image de la page dès que le texte contient des mathématiques ou que la confiance est faible, et le résultat est enregistré avec la page. Si le tuteur n'arrive pas à interpréter ta réponse, il demande lui-même l'image.")
+            Text("La reconnaissance locale combine la lecture du texte par l'iPad (Vision) et un reconnaisseur de symboles sur les traits du Pencil (∀, ∃, ∈, ⊂, ⇒, ε, δ…). En mode automatique, Claude n'est appelé que si des symboles restent incertains ou si la lecture est douteuse ; sa réponse est enregistrée avec la page. Si le tuteur n'arrive pas à interpréter ta réponse, il demande lui-même l'image.")
+        }
+    }
+
+    private var symbolsSection: some View {
+        Section {
+            Toggle("Apprendre mes symboles à partir des lectures de Claude", isOn: $settings.learnSymbolsFromClaude)
+            let counts = library.learnedCounts
+            if counts.isEmpty {
+                Text("Aucun symbole appris pour l'instant : \(library.seeds.count) gabarits de départ (∀, ∃, ∈, ⊂, ⇒, ⇔, ≤, ≥, ≠, ∅, ∞, ε, δ…).")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            } else {
+                Text("\(library.learned.count) exemples appris pour \(counts.count) symboles : "
+                     + counts.prefix(16).map { "\($0.label) (\($0.count))" }.joined(separator: ", ")
+                     + (counts.count > 16 ? "…" : ""))
+                    .font(.subheadline)
+            }
+            Button("Réinitialiser les symboles appris", role: .destructive) {
+                confirmResetSymbols = true
+            }
+            .disabled(library.learned.isEmpty)
+            .confirmationDialog("Supprimer tous les exemples appris ?", isPresented: $confirmResetSymbols, titleVisibility: .visible) {
+                Button("Réinitialiser", role: .destructive) { library.reset() }
+            }
+        } header: {
+            Text("Symboles manuscrits (reconnaissance locale)")
+        } footer: {
+            Text("Quand un symbole est incertain, la page est envoyée à Claude avec des cadres numérotés ; sa lecture de chaque cadre est ajoutée comme exemple de ton écriture, et l'iPad le reconnaît ensuite seul. Les exemples restent sur l'iPad.")
         }
     }
 

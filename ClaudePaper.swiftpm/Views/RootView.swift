@@ -4,6 +4,7 @@ import SwiftUI
 struct RootView: View {
     @EnvironmentObject private var store: SessionStore
     @EnvironmentObject private var settings: AppSettings
+    @EnvironmentObject private var library: SymbolLibrary
     @State private var selection: UUID?
     @State private var showSettings = false
     @State private var showNewSession = false
@@ -56,7 +57,7 @@ struct RootView: View {
             }
         } detail: {
             if let id = selection, let session = store.session(withID: id) {
-                SessionView(session: session, store: store, settings: settings)
+                SessionView(session: session, store: store, settings: settings, library: library)
                     .id(session.id)
             } else {
                 ContentUnavailableView {

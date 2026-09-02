@@ -5,8 +5,9 @@ struct SessionView: View {
     @StateObject private var model: SessionViewModel
     @EnvironmentObject private var settings: AppSettings
 
-    init(session: StudySession, store: SessionStore, settings: AppSettings) {
-        _model = StateObject(wrappedValue: SessionViewModel(session: session, store: store, settings: settings))
+    @MainActor
+    init(session: StudySession, store: SessionStore, settings: AppSettings, library: SymbolLibrary) {
+        _model = StateObject(wrappedValue: SessionViewModel(session: session, store: store, settings: settings, library: library))
     }
 
     var body: some View {

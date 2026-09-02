@@ -32,6 +32,7 @@ final class SessionViewModel: ObservableObject {
         var text: String
         var transcription: Transcription
         var snapshot: PageSnapshot?
+        var local: LocalRecognition?
     }
 
     @Published var session: StudySession
@@ -55,15 +56,16 @@ final class SessionViewModel: ObservableObject {
     private let tutor: TutorService
     private let transcriber: TranscriptionService
     private var currentTask: Task<Void, Never>? = nil
+    private var runGeneration = 0
 
-    init(session: StudySession, store: SessionStore, settings: AppSettings) {
+    init(session: StudySession, store: SessionStore, settings: AppSettings, library: SymbolLibrary) {
         self.session = session
         self.store = store
         self.settings = settings
         let client = AnthropicClient(apiKeyProvider: { settings.apiKey })
         self.client = client
         tutor = TutorService(client: client, attachments: store.attachments)
-        transcriber = TranscriptionService(client: client)
+        transcriber = TranscriptionService(client: client, library: library)
         if session.pages.isEmpty {
             self.session.pages = [Page(number: 1)]
             self.session.currentPageIndex = 0
@@ -237,7 +239,8 @@ final class SessionViewModel: ObservableObject {
                 drawing: self.drawing,
                 mode: self.settings.transcriptionMode,
                 model: self.settings.transcriptionModel,
-                useFallbacks: self.settings.useServerFallbacks
+                useFallbacks: self.settings.useServerFallbacks,
+                learnFromClaude: self.settings.learnSymbolsFromClaude
             ) { stage in
                 self.activity = .transcribing(stage)
             }
@@ -247,7 +250,8 @@ final class SessionViewModel: ObservableObject {
             if self.settings.reviewTranscriptionBeforeSending {
                 self.pendingTranscription = PendingTranscription(text: outcome.transcription.text,
                                                                  transcription: outcome.transcription,
-                                                                 snapshot: outcome.snapshot)
+                                                                 snapshot: outcome.snapshot,
+                                                                 local: outcome.local)
             } else {
                 try await self.submitAnswer(outcome.transcription, snapshot: outcome.snapshot)
             }
@@ -261,8 +265,10 @@ final class SessionViewModel: ObservableObject {
             let transcription = try await self.transcriber.transcribeWithClaude(
                 snapshot: snapshot,
                 draft: pending.transcription.onDeviceDraft ?? pending.transcription.text,
+                local: pending.local,
                 model: self.settings.transcriptionModel,
-                useFallbacks: self.settings.useServerFallbacks
+                useFallbacks: self.settings.useServerFallbacks,
+                learn: self.settings.learnSymbolsFromClaude
             )
             var updated = transcription
             updated.onDeviceDraft = pending.transcription.onDeviceDraft ?? pending.transcription.text
@@ -426,7 +432,7 @@ final class SessionViewModel: ObservableObject {
         if session.title.isEmpty || session.title == "Nouvelle discussion" {
             session.title = String(trimmed.prefix(48))
         }
-        run(activityText: nil) {
+        run(activityText: "Claude répond…") {
             self.appendMessage(ChatMessage(role: .user, kind: kind, text: trimmed.isEmpty ? "📎 Documents joints" : trimmed,
                                            apiText: apiText, attachmentIDs: attachmentIDs,
                                            pageID: kind == .help ? self.page.id : nil))
@@ -458,6 +464,7 @@ final class SessionViewModel: ObservableObject {
                     stopDetails = details
                 }
             }
+            try Task.checkCancellation()
             self.streamingText = ""
             self.thinkingText = ""
             if stopReason == "refusal" {
@@ -612,13 +619,15 @@ final class SessionViewModel: ObservableObject {
             return
         }
         if let activityText { activity = .thinking(activityText) }
+        runGeneration += 1
+        let generation = runGeneration
         currentTask = Task { [weak self] in
             do {
                 try await operation()
             } catch is CancellationError {
                 // Interrompu par l'utilisateur.
             } catch {
-                guard let self else { return }
+                guard let self, self.runGeneration == generation else { return }
                 let description = error.localizedDescription
                 self.errorMessage = description
                 self.appendMessage(ChatMessage(role: .assistant, kind: .note, text: "⚠️ \(description)", isError: true))
@@ -626,7 +635,7 @@ final class SessionViewModel: ObservableObject {
                     self.session.currentPage.status = .drafting
                 }
             }
-            guard let self else { return }
+            guard let self, self.runGeneration == generation else { return }
             self.activity = nil
             self.streamingText = ""
             self.thinkingText = ""

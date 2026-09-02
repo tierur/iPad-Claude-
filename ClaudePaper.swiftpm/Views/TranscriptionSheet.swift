@@ -10,6 +10,11 @@ struct TranscriptionSheet: View {
             VStack(alignment: .leading, spacing: 12) {
                 if let pending = model.pendingTranscription {
                     header(for: pending.transcription)
+                    if let summary = localSummary(for: pending.transcription) {
+                        Text(summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     if let snapshot = pending.snapshot {
                         Image(uiImage: snapshot.image)
                             .resizable()
@@ -84,6 +89,21 @@ struct TranscriptionSheet: View {
             get: { model.pendingTranscription?.text ?? "" },
             set: { model.pendingTranscription?.text = $0 }
         )
+    }
+
+    private func localSummary(for transcription: Transcription) -> String? {
+        guard transcription.localSymbolCount != nil || transcription.uncertainSymbolCount != nil else { return nil }
+        var parts: [String] = []
+        if let local = transcription.localSymbolCount {
+            parts.append(local == 0 ? "aucun symbole reconnu localement" : "\(local) symbole\(local > 1 ? "s" : "") reconnu\(local > 1 ? "s" : "") localement")
+        }
+        if let uncertain = transcription.uncertainSymbolCount, uncertain > 0 {
+            parts.append("\(uncertain) incertain\(uncertain > 1 ? "s" : "")" + (transcription.source == .claudeVision ? " lu\(uncertain > 1 ? "s" : "") par Claude" : ""))
+        }
+        if let learned = transcription.learnedSymbolCount, learned > 0 {
+            parts.append("\(learned) exemple\(learned > 1 ? "s" : "") ajouté\(learned > 1 ? "s" : "") à la bibliothèque locale")
+        }
+        return parts.isEmpty ? nil : "Reconnaissance locale : " + parts.joined(separator: " · ") + "."
     }
 
     private func header(for transcription: Transcription) -> some View {

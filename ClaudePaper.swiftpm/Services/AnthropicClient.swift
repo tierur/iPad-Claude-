@@ -130,6 +130,7 @@ struct StreamPayload: Decodable {
     var delta: Delta?
     var usage: Usage?
     var error: APIErrorBody?
+    var stopDetails: StopDetails?
 
     struct MessageHeader: Decodable {
         var id: String?
@@ -295,6 +296,7 @@ final class AnthropicClient {
                 response.usage = usage
             }
         }
+        try Task.checkCancellation()
         if response.stopReason == "refusal" {
             throw ClaudeError.refused(category: response.stopDetails?.category, explanation: response.stopDetails?.explanation)
         }
@@ -366,54 +368,78 @@ final class AnthropicClient {
         var stopDetails: StopDetails? = nil
         var finishedSent = false
 
-        // Chaque événement de l'API tient sur une seule ligne « data: {...} ».
-        for try await line in bytes.lines {
-            try Task.checkCancellation()
-            guard line.hasPrefix("data:") else { continue }
-            let jsonString = String(line.dropFirst(5)).trimmingCharacters(in: .whitespaces)
-            guard !jsonString.isEmpty, let data = jsonString.data(using: .utf8) else { continue }
-            guard let payload = try? decoder.decode(StreamPayload.self, from: data) else { continue }
-
-            switch payload.type {
-            case "message_start":
-                if let messageUsage = payload.message?.usage { usage.merge(messageUsage) }
-                continuation.yield(.started(model: payload.message?.model ?? ""))
-
-            case "content_block_start":
-                let blockType = payload.contentBlock?.type ?? ""
-                if blockType == "fallback" {
-                    continuation.yield(.fallback(from: payload.contentBlock?.from?.model ?? "?",
-                                                 to: payload.contentBlock?.to?.model ?? "?"))
-                } else if blockType == "text", let text = payload.contentBlock?.text, !text.isEmpty {
-                    continuation.yield(.text(text))
-                }
-
-            case "content_block_delta":
-                let deltaType = payload.delta?.type ?? ""
-                if deltaType == "text_delta", let text = payload.delta?.text {
-                    continuation.yield(.text(text))
-                } else if deltaType == "thinking_delta", let text = payload.delta?.thinking, !text.isEmpty {
-                    continuation.yield(.thinking(text))
-                }
-
-            case "message_delta":
-                if let deltaUsage = payload.usage { usage.merge(deltaUsage) }
-                if let reason = payload.delta?.stopReason { stopReason = reason }
-                if let details = payload.delta?.stopDetails { stopDetails = details }
-
-            case "message_stop":
-                continuation.yield(.finished(stopReason: stopReason, stopDetails: stopDetails, usage: usage))
-                finishedSent = true
-
-            case "error":
-                throw ClaudeError.streamError(payload.error?.message ?? "erreur inconnue")
-
-            default:
-                break // ping, content_block_stop, …
+        // Chaque événement de l'API tient sur une seule ligne « data: {...} ». On découpe nous-mêmes
+        // sur les octets \n : `AsyncLineSequence` couperait aussi sur U+2028/U+2029, que le JSON n'échappe pas.
+        var buffer = Data()
+        var lines: [Data] = []
+        for try await byte in bytes {
+            if byte == 0x0A {
+                lines.append(buffer)
+                buffer = Data()
+            } else {
+                buffer.append(byte)
+            }
+            guard !lines.isEmpty else { continue }
+            let pending = lines
+            lines.removeAll(keepingCapacity: true)
+            for lineData in pending {
+                try Task.checkCancellation()
+                guard let line = String(data: lineData, encoding: .utf8) else { continue }
+                guard line.hasPrefix("data:") else { continue }
+                let jsonString = String(line.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !jsonString.isEmpty, let data = jsonString.data(using: .utf8) else { continue }
+                guard let payload = try? decoder.decode(StreamPayload.self, from: data) else { continue }
+                try handle(payload, continuation: continuation, usage: &usage, stopReason: &stopReason,
+                           stopDetails: &stopDetails, finishedSent: &finishedSent)
             }
         }
         if !finishedSent {
             continuation.yield(.finished(stopReason: stopReason, stopDetails: stopDetails, usage: usage))
+        }
+    }
+
+    private func handle(_ payload: StreamPayload,
+                        continuation: AsyncThrowingStream<ClaudeEvent, Error>.Continuation,
+                        usage: inout TokenUsage,
+                        stopReason: inout String?,
+                        stopDetails: inout StopDetails?,
+                        finishedSent: inout Bool) throws {
+        switch payload.type {
+        case "message_start":
+            if let messageUsage = payload.message?.usage { usage.merge(messageUsage) }
+            continuation.yield(.started(model: payload.message?.model ?? ""))
+
+        case "content_block_start":
+            let blockType = payload.contentBlock?.type ?? ""
+            if blockType == "fallback" {
+                continuation.yield(.fallback(from: payload.contentBlock?.from?.model ?? "?",
+                                             to: payload.contentBlock?.to?.model ?? "?"))
+            } else if blockType == "text", let text = payload.contentBlock?.text, !text.isEmpty {
+                continuation.yield(.text(text))
+            }
+
+        case "content_block_delta":
+            let deltaType = payload.delta?.type ?? ""
+            if deltaType == "text_delta", let text = payload.delta?.text {
+                continuation.yield(.text(text))
+            } else if deltaType == "thinking_delta", let text = payload.delta?.thinking, !text.isEmpty {
+                continuation.yield(.thinking(text))
+            }
+
+        case "message_delta":
+            if let deltaUsage = payload.usage { usage.merge(deltaUsage) }
+            if let reason = payload.delta?.stopReason { stopReason = reason }
+            if let details = payload.delta?.stopDetails ?? payload.stopDetails { stopDetails = details }
+
+        case "message_stop":
+            continuation.yield(.finished(stopReason: stopReason, stopDetails: stopDetails, usage: usage))
+            finishedSent = true
+
+        case "error":
+            throw ClaudeError.streamError(payload.error?.message ?? "erreur inconnue")
+
+        default:
+            break // ping, content_block_stop, …
         }
     }
 }

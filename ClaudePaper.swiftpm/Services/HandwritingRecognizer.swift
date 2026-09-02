@@ -2,11 +2,19 @@ import Foundation
 import UIKit
 import Vision
 
+struct RecognizedCharacter {
+    let text: String
+    /// Rectangle normalisé (origine en bas à gauche, convention Vision).
+    let box: CGRect
+}
+
 struct RecognizedLine {
     let text: String
     let confidence: Double
-    /// Rectangle normalisé (origine en bas à gauche, convention Vision).
+    /// Rectangle normalisé de la ligne (convention Vision).
     let box: CGRect
+    /// Caractères avec leur position (même ordre que `text`).
+    let characters: [RecognizedCharacter]
 }
 
 struct RecognitionResult {
@@ -26,7 +34,7 @@ enum RecognitionError: LocalizedError {
     var errorDescription: String? { "Image illisible pour la reconnaissance." }
 }
 
-/// Reconnaissance d'écriture manuscrite sur l'iPad (framework Vision), français puis anglais.
+/// Reconnaissance de texte manuscrit sur l'iPad (framework Vision), français puis anglais.
 enum HandwritingRecognizer {
     static func recognize(_ image: UIImage, mathMode: Bool) async throws -> RecognitionResult {
         guard let cgImage = image.cgImage else { throw RecognitionError.invalidImage }
@@ -44,18 +52,32 @@ enum HandwritingRecognizer {
                 request.recognitionLanguages = wanted
             }
             if mathMode {
-                request.customWords = ["∀", "∃", "∈", "⊂", "⇒", "⇔", "lim", "sup", "inf", "sin", "cos", "exp", "ln", "ouvert", "fermé", "compact", "voisinage"]
+                request.customWords = ["lim", "sup", "inf", "sin", "cos", "exp", "ln", "ouvert", "fermé", "compact", "voisinage", "borné", "continue"]
             }
 
             let handler = VNImageRequestHandler(cgImage: cgImage, orientation: .up, options: [:])
             try handler.perform([request])
 
             let observations = request.results ?? []
-            let lines: [RecognizedLine] = observations.compactMap { observation in
-                guard let candidate = observation.topCandidates(1).first else { return nil }
-                return RecognizedLine(text: candidate.string,
-                                      confidence: Double(candidate.confidence),
-                                      box: observation.boundingBox)
+            var lines: [RecognizedLine] = []
+            for observation in observations {
+                guard let candidate = observation.topCandidates(1).first else { continue }
+                let string = candidate.string
+                var characters: [RecognizedCharacter] = []
+                var index = string.startIndex
+                var previousBox = observation.boundingBox
+                while index < string.endIndex {
+                    let next = string.index(after: index)
+                    let range = index..<next
+                    let box = (try? candidate.boundingBox(for: range))?.boundingBox ?? previousBox
+                    characters.append(RecognizedCharacter(text: String(string[range]), box: box))
+                    previousBox = box
+                    index = next
+                }
+                lines.append(RecognizedLine(text: string,
+                                            confidence: Double(candidate.confidence),
+                                            box: observation.boundingBox,
+                                            characters: characters))
             }
             // Ordre de lecture : de haut en bas (Vision a l'origine en bas), puis de gauche à droite.
             let sorted = lines.sorted { lhs, rhs in

@@ -15,9 +15,9 @@ enum TranscriptionMode: String, CaseIterable, Codable, Identifiable {
 
     var label: String {
         switch self {
-        case .auto: return "Automatique (iPad puis Claude si besoin)"
+        case .auto: return "Automatique (local, puis Claude en cas de doute)"
         case .alwaysClaude: return "Toujours analyser l'image avec Claude"
-        case .onDeviceOnly: return "Seulement la reconnaissance de l'iPad"
+        case .onDeviceOnly: return "Seulement la reconnaissance locale"
         }
     }
 }
@@ -68,6 +68,7 @@ final class AppSettings: ObservableObject {
     @Published var useServerFallbacks: Bool { didSet { defaults.set(useServerFallbacks, forKey: "useServerFallbacks") } }
     @Published var paperStyle: PaperStyle { didSet { defaults.set(paperStyle.rawValue, forKey: "paperStyle") } }
     @Published var reviewTranscriptionBeforeSending: Bool { didSet { defaults.set(reviewTranscriptionBeforeSending, forKey: "reviewTranscriptionBeforeSending") } }
+    @Published var learnSymbolsFromClaude: Bool { didSet { defaults.set(learnSymbolsFromClaude, forKey: "learnSymbolsFromClaude") } }
 
     init() {
         let defaults = UserDefaults.standard
@@ -83,6 +84,7 @@ final class AppSettings: ObservableObject {
         useServerFallbacks = defaults.object(forKey: "useServerFallbacks") as? Bool ?? true
         paperStyle = PaperStyle(rawValue: defaults.string(forKey: "paperStyle") ?? "") ?? .lines
         reviewTranscriptionBeforeSending = defaults.object(forKey: "reviewTranscriptionBeforeSending") as? Bool ?? true
+        learnSymbolsFromClaude = defaults.object(forKey: "learnSymbolsFromClaude") as? Bool ?? true
     }
 
     var hasAPIKey: Bool {

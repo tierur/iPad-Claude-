@@ -62,7 +62,7 @@ enum TranscriptionSource: String, Codable {
 
     var label: String {
         switch self {
-        case .onDevice: return "reconnaissance sur l'iPad"
+        case .onDevice: return "reconnaissance locale sur l'iPad"
         case .claudeVision: return "analyse de l'image par Claude"
         case .manual: return "corrigée à la main"
         }
@@ -76,6 +76,12 @@ struct Transcription: Codable, Equatable {
     var onDeviceDraft: String? = nil
     var modelID: String? = nil
     var createdAt: Date = Date()
+    /// Symboles reconnus localement (quantificateurs, ensembles, flèches…).
+    var localSymbolCount: Int? = nil
+    /// Symboles que la reconnaissance locale a laissés à Claude.
+    var uncertainSymbolCount: Int? = nil
+    /// Symboles appris (ajoutés à la bibliothèque locale) grâce à la lecture de Claude.
+    var learnedSymbolCount: Int? = nil
 }
 
 // MARK: - Retour du tuteur
