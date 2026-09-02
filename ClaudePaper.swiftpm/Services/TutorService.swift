@@ -24,7 +24,7 @@ enum RequestBuilder {
                 request.thinking = ThinkingParam(type: "adaptive", display: "summarized")
             }
         case .adaptive:
-            request.thinking = ThinkingParam(type: "adaptive", display: showThinking ? "summarized" : "omitted")
+            request.thinking = ThinkingParam(type: "adaptive", display: showThinking ? "summarized" : nil)
         case .budget:
             // Claude Haiku 4.5 : pas de réflexion (rapide et économique).
             break

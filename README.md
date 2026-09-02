@@ -34,7 +34,7 @@ Avant l'envoi, une feuille de relecture montre l'image, le texte reconnu (modifi
 1. Ouvre `ClaudePaper.swiftpm` avec Xcode (Fichier → Ouvrir).
 2. Choisis ton iPad (ou un simulateur iPad) et lance. Pour installer sur un iPad physique, sélectionne ton équipe de signature dans *Signing & Capabilities* (ou renseigne `teamIdentifier` dans `Package.swift`).
 
-Si `appIcon: .placeholder(icon: .pencil)` est refusé par ta version de Swift Playgrounds, remplace `.pencil` par `.bicycle` (icône par défaut) dans `Package.swift`.
+L'icône est une icône de substitution (`.placeholder(icon: .pencil)`) : pour une icône personnalisée, ajoute un catalogue `Assets.xcassets` avec un `AppIcon` et remplace par `.asset("AppIcon")` dans `Package.swift`.
 
 ## Connexion à Claude (clé API)
 
